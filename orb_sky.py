@@ -24,8 +24,7 @@
 import logging
 import datetime
 import math
-
-from skyfield.almanac import phase_angle
+import bisect
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +37,30 @@ except ImportError as e:
 
 import dateutil.relativedelta
 from dateutil.tz import tzutc
+
+
+def _find_next_datetime(sorted_datetimes, target):
+    index = bisect.bisect_right(sorted_datetimes, target)
+    if index < len(sorted_datetimes):
+        return sorted_datetimes[index]
+    else:
+        return None
+
+def merge_sorted_datetimes(list1, list2):
+    merged = []
+    i = j = 0
+    # Vergleiche Elemente und füge das kleinere hinzu
+    while i < len(list1) and j < len(list2):
+        if list1[i] <= list2[j]:
+            merged.append(list1[i])
+            i += 1
+        else:
+            merged.append(list2[j])
+            j += 1
+    # Füge restliche Elemente hinzu
+    merged.extend(list1[i:])
+    merged.extend(list2[j:])
+    return merged
 
 
 class Orb():
@@ -69,20 +92,24 @@ class Orb():
         :param lat: latitude of observer in degrees
         :param elev: elevation of observer in meters
         """
-        self.orb = orb
+        self.orb_name = orb
         self.lat = lat
         self.lon = lon
         self.elev = elev
+        self.rise_cache = dict()
 
         # Load Skyfield data
         # Ephemeriden laden (mit Kontext-Manager öffnen)
         self.load = Loader('~/.skyfield-data')
         self.planets = self.load('de421.bsp')
         self.ts = self.load.timescale()
+        self.orb = self.planets[orb]
 
         # Define observer's location separately as topos
         self.topos = wgs84.latlon(latitude_degrees=self.lat * N, longitude_degrees=self.lon * E, elevation_m=self.elev)
         self.observer = self.planets['earth'] + self.topos
+
+
 
     def get_observer_and_orb(self):
         """
@@ -92,119 +119,85 @@ class Orb():
 
         :return: tuple of observer and celestial body
         """
-        if self.orb == 'sun':
-            orb = self.planets['sun']
-        elif self.orb == 'moon':
-            orb = self.planets['moon']
+        if self.orb_name == 'moon':
             self.phase = self._phase
             self.light = self._light
-        else:
-            orb = None
-            logger.error(f"Unknown celestial body {self.orb}")
-            raise ValueError(f"Unknown celestial body {self.orb}")
 
-        return self.observer, orb
+        return self.observer, self.orb
 
-    def _avoid_neverup(self, dt, date_utc, doff):
-        """
-        When specifying an offset for e.g. a sunset or a sunrise it might well be that the
-        offset is too high to be ever reached for a specific location and time
-        Therefore this function will limit this offset and return it to the calling function
-
-        :param dt: starting point for calculation
-        :type dt: datetime
-        :param date_utc: a datetime with utc time
-        :type date_utc: datetime
-        :param doff: offset in degrees
-        :type doff: float
-        :return: corrected offset in degrees
-        :rtype: float
-        """
-        originaldoff = doff
-
-        # Get times for noon and midnight
-        midnight = self.midnight(0, 0, dt=dt)
-        noon = self.noon(0, 0, dt=dt)
-
-        # If the altitudes are calculated from previous or next day, set the correct day for the observer query
-        noon = noon if noon >= date_utc else \
-            self.noon(0, 0, dt=date_utc + dateutil.relativedelta.relativedelta(days=1))
-        midnight = midnight if midnight >= date_utc else \
-            self.midnight(0, 0, dt=date_utc - dateutil.relativedelta.relativedelta(days=1))
-        # Get lowest and highest altitudes of the relevant day/night
-        max_altitude = self.pos(offset=None, degree=True, dt=midnight)[1] if doff <= 0 else \
-            self.pos(offset=None, degree=True, dt=noon)[1]
-
-        # Limit degree offset to the highest or lowest possible for the given date
-        doff = max(doff, max_altitude + 0.00001) if doff < 0 else min(doff,
-                                                                      max_altitude - 0.00001) if doff > 0 else doff
-        if not originaldoff == doff:
-            logger.notice(f"offset {originaldoff} truncated to {doff}")
-        return doff
-
-    def noon(self, doff=0, moff=0, dt=None):
+    def noon(self, moff=0, dt=None):
         observer, orb = self.get_observer_and_orb()
-        if dt is not None:
-            date_utc = dt.replace(tzinfo=tzutc())
-        else:
-            date_utc = datetime.datetime.utcnow().replace(tzinfo=tzutc())
+        date_utc = self._datetime_in_utc(dt)
 
         t = self.ts.from_datetime(date_utc)
-        if not doff == 0:
-            doff = self._avoid_neverup(dt, date_utc, doff)
 
         # Finde den nächsten Transit
         start_time = t
-        end_time = self.ts.from_datetime(date_utc + datetime.timedelta(days=1))  # Suche im nächsten Tag
+        end_time = self.ts.from_datetime(date_utc + datetime.timedelta(days=2))  # Suche im nächsten Tag
 
         times = almanac.find_transits(observer, orb, start_time, end_time)
 
-        if len(times) > 0:
+        if times:
             next_transit = times[0].utc_datetime()
         else:
-            raise ValueError("Kein Transit gefunden.")
+            raise ValueError("No transit found.")
 
         next_transit = next_transit + dateutil.relativedelta.relativedelta(minutes=moff)
-        next_transit = next_transit.replace(tzinfo=tzutc())
-        logger.debug(f"skyfield: noon for {self.orb} with doff={doff}, moff={moff}, dt={dt} will be {next_transit}")
+        next_transit = next_transit.astimezone(datetime.UTC)
+        logger.debug(f"skyfield: noon for {self.orb} with moff={moff}, dt={dt} will be {next_transit}")
         return next_transit
 
-    def midnight(self, doff=0, moff=0, dt=None):
+    def midnight(self, moff=0, dt=None):
         observer, orb = self.get_observer_and_orb()
-        if dt is not None:
-            date_utc = dt.replace(tzinfo=tzutc())
-        else:
-            date_utc = datetime.datetime.utcnow().replace(tzinfo=tzutc())
+        date_utc = self._datetime_in_utc(dt)
 
         t = self.ts.from_datetime(date_utc)
-        if not doff == 0:
-            doff = self._avoid_neverup(dt, date_utc, doff)
 
-        # Definiere eine Funktion, um Antitransits zu finden
-        def is_antitransit(t):
-            """Gibt True zurück, wenn der Himmelskörper im Antitransit ist."""
-            alt, az, _ = observer.at(t).observe(orb).apparent().altaz()
-            return alt.degrees < 0  # Antitransit, wenn der Körper unter dem Horizont ist
-
-        # Finde den nächsten Antitransit
         start_time = t
-        end_time = self.ts.from_datetime(date_utc + datetime.timedelta(days=1))  # Suche im nächsten Tag
-        #times = almanac.find_transits(observer, orb, start_time, end_time)
+        end_time = self.ts.from_datetime(date_utc + datetime.timedelta(days=2))  # Suche im nächsten Tag
 
         def _transit_ha(latitude, declination, altitude_radians):
             return math.pi
-        times, _ = almanac._find(observer, orb, start_time, end_time, 0.0, _transit_ha)
+        times, _ = almanac._find(observer, orb, start_time, end_time, 0, _transit_ha)
 
-        if len(times) > 0:
+        if times:
             next_antitransit = times[0].utc_datetime()
         else:
-            raise ValueError("Kein Antitransit gefunden.")
+            raise ValueError("No antitransit found.")
 
         next_antitransit = next_antitransit + dateutil.relativedelta.relativedelta(minutes=moff)
-        next_antitransit = next_antitransit.replace(tzinfo=tzutc())
+        next_antitransit = next_antitransit.astimezone(datetime.UTC)
         logger.debug(
-            f"skyfield: midnight for {self.orb} with doff={doff}, moff={moff}, dt={dt} will be {next_antitransit}")
+            f"skyfield: midnight for {self.orb} with moff={moff}, dt={dt} will be {next_antitransit}")
         return next_antitransit
+
+    def rise_cached(self, doff=0, moff=0, center=True, dt=None):
+        observer, orb = self.get_observer_and_orb()
+        date_utc = self._datetime_in_utc(dt)
+
+        t = self.ts.from_datetime(date_utc)
+        if doff not in self.rise_cache:
+            times, events = almanac.find_risings(observer, orb, t, t + datetime.timedelta(days=3), doff)
+            self.rise_cache[doff] = [time.utc_datetime() for time in times]
+
+        if len(self.rise_cache[doff]) > 2000:
+            self.rise_cache[doff] = []
+
+        next_rise = _find_next_datetime(self.rise_cache[doff], date_utc)
+
+        if next_rise is None:
+            times, events = almanac.find_risings(observer, orb, t, t + datetime.timedelta(days=3), doff)
+            new_times = [time.utc_datetime() for time in times]
+            self.rise_cache[doff] = merge_sorted_datetimes(self.rise_cache[doff], new_times)
+            if times:
+                next_rise = times[0].utc_datetime()
+            else:
+                raise ValueError("No rise found.")
+
+        next_rise += dateutil.relativedelta.relativedelta(minutes=moff)
+        logger.debug(
+            f"skyfield: next_rise for {self.orb} with doff={doff}, moff={moff}, center={center}, dt={dt} will be {next_rise}")
+        return next_rise
 
     def rise(self, doff=0, moff=0, center=True, dt=None):
         """
@@ -216,29 +209,24 @@ class Orb():
         :return:
         """
         observer, orb = self.get_observer_and_orb()
-        if dt is not None:
-            date_utc = dt.replace(tzinfo=tzutc())
-        else:
-            date_utc = datetime.datetime.utcnow().replace(tzinfo=tzutc())
+        date_utc = self._datetime_in_utc(dt)
 
         t = self.ts.from_datetime(date_utc)
-        if not doff == 0:
-            doff = self._avoid_neverup(dt, date_utc, doff)
 
-        # Verwende almanac.risings_and_settings, um das nächste Set-Ereignis zu berechnen
-        times, events = almanac.find_risings(observer, orb, t, t + datetime.timedelta(days=1))
-
+        times, events = almanac.find_risings(observer, orb, t, t + datetime.timedelta(days=2), doff)
         next_rising = None
+
         for time, event in zip(times, events):
-            if event == True:  # True = Aufgang
-                next_rising = time.utc_datetime()
-                break
+            if not event:  # True = Aufgang
+                logger.info("No rise found, returned time is transit time instead")
+            next_rising = time.utc_datetime()
+            break
 
         if next_rising is None:
-            raise ValueError("Kein Aufgang gefunden.")
+            # should not happen
+            raise ValueError("No rise found.")
 
         next_rising = next_rising + dateutil.relativedelta.relativedelta(minutes=moff)
-        next_rising = next_rising.replace(tzinfo=tzutc())
         logger.debug(
             f"skyfield: next_rising for {self.orb} with doff={doff}, moff={moff}, center={center}, dt={dt} will be {next_rising}")
         return next_rising
@@ -253,29 +241,24 @@ class Orb():
         :return:
         """
         observer, orb = self.get_observer_and_orb()
-        if dt is not None:
-            date_utc = dt.replace(tzinfo=tzutc())
-        else:
-            date_utc = datetime.datetime.utcnow().replace(tzinfo=tzutc())
+        date_utc = self._datetime_in_utc(dt)
 
         t = self.ts.from_datetime(date_utc)
-        if not doff == 0:
-            doff = self._avoid_neverup(dt, date_utc, doff)
 
         # Verwende almanac.risings_and_settings, um das nächste Set-Ereignis zu berechnen
-        times, events = almanac.find_settings(observer, orb, t, t + datetime.timedelta(days=1))
+        times, events = almanac.find_settings(observer, orb, t, t + datetime.timedelta(days=2),doff)
 
         next_setting = None
         for time, event in zip(times, events):
-            if event == True:  # 0 = Set-Ereignis
-                next_setting = time.utc_datetime()
-                break
+            if not event:  # True = Aufgang
+                logger.info("No setting found, returned time is transit time instead")
+            next_setting = time.utc_datetime()
+            break
 
         if next_setting is None:
-            raise ValueError("Kein Set-Ereignis gefunden.")
+            raise ValueError("No set found.")
 
         next_setting = next_setting + dateutil.relativedelta.relativedelta(minutes=moff)
-        next_setting = next_setting.replace(tzinfo=tzutc())
         logger.debug(
             f"skyfield: next_setting for {self.orb} with doff={doff}, moff={moff}, center={center}, dt={dt} will be {next_setting}")
         return next_setting
@@ -289,14 +272,11 @@ class Orb():
         :return:        a tuple with azimuth and elevation
         """
         observer, orb = self.get_observer_and_orb()
-        if dt is None:
-            date = datetime.datetime.utcnow()
-        else:
-            date = dt.replace(tzinfo=tzutc())
+        date_utc = self._datetime_in_utc(dt)
         if offset:
-            date += dateutil.relativedelta.relativedelta(minutes=offset)
+            date_utc += dateutil.relativedelta.relativedelta(minutes=offset)
 
-        t = self.ts.from_datetime(date)
+        t = self.ts.from_datetime(date_utc)
         astrometric = observer.at(t).observe(orb)
         alt, az, _ = astrometric.apparent().altaz()
 
@@ -338,7 +318,6 @@ class Orb():
         for the current time plus an offset
         :param offset: an offset given in minutes
         """
-        observer, orb = self.get_observer_and_orb()
         date = datetime.datetime.now(datetime.UTC) # UTC-Zeit mit Zeitzoneninformation
         if offset:
             date += dateutil.relativedelta.relativedelta(minutes=offset)
@@ -349,3 +328,9 @@ class Orb():
         phase_angle = almanac.moon_phase(self.planets, t).degrees
         phase = (phase_angle / 360 * 8)
         return int(round(phase))
+
+    def _datetime_in_utc(self, dt):
+        if dt is not None:
+            return dt.astimezone(datetime.UTC)
+        else:
+            return datetime.datetime.now(datetime.UTC)
