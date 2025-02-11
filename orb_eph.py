@@ -145,7 +145,7 @@ class Orb():
         doff = max(doff, max_altitude + 0.00001) if doff < 0 else min(doff,
                                                                       max_altitude - 0.00001) if doff > 0 else doff
         if not originaldoff == doff:
-            logger.notice(f"offset {originaldoff} truncated to {doff}")
+            logger.info(f"offset {originaldoff} truncated to {doff}")
         return doff
 
     def noon(self, doff=0, moff=0, dt=None):
@@ -206,7 +206,7 @@ class Orb():
                 minutes=moff) + dateutil.relativedelta.relativedelta(seconds=2)
             date_utc = (observer.date.datetime()).replace(tzinfo=tzutc())
         if not doff == 0:
-            doff = self._avoid_neverup(dt, date_utc, doff)
+            doff = self._avoid_neverup(dt, date_utc, doff) * 0.99
         observer.horizon = str(doff)
         if not doff == 0:
             next_rising = observer.next_rising(orb, use_center=center).datetime()
@@ -262,7 +262,7 @@ class Orb():
         if dt is None:
             date = datetime.datetime.utcnow()
         else:
-            date = dt.replace(tzinfo=tzutc())
+            date = dt.astimezone(datetime.UTC)
         if offset:
             date += dateutil.relativedelta.relativedelta(minutes=offset)
         observer.date = date
