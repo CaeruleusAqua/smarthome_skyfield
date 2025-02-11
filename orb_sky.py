@@ -97,6 +97,11 @@ class Orb():
         self.lon = lon
         self.elev = elev
         self.rise_cache = dict()
+        self.set_cache = dict()
+        self.noon_cache = []
+        self.midnight_cache = []
+        self.max_cache_size = 2000
+        self.cache_prefill_horizon = 365
 
         # Load Skyfield data
         # Ephemeriden laden (mit Kontext-Manager öffnen)
@@ -125,6 +130,38 @@ class Orb():
 
         return self.observer, self.orb
 
+    def noon_cached(self, moff=0, dt=None):
+        observer, orb = self.get_observer_and_orb()
+        date_utc = self._datetime_in_utc(dt)
+
+        t = self.ts.from_datetime(date_utc)
+
+        if not self.noon_cache:
+            start_time = t
+            end_time = self.ts.from_datetime(date_utc + datetime.timedelta(days=self.cache_prefill_horizon ))
+            times = almanac.find_transits(observer, orb, start_time, end_time)
+            self.noon_cache = [time.utc_datetime() for time in times]
+
+        if len(self.noon_cache) > self.max_cache_size:
+            self.noon_cache = []
+
+        next_transit = _find_next_datetime(self.noon_cache, date_utc)
+
+        if next_transit is None:
+            start_time = t
+            end_time = self.ts.from_datetime(date_utc + datetime.timedelta(days=self.cache_prefill_horizon))
+            times = almanac.find_transits(observer, orb, start_time, end_time)
+            new_times = [time.utc_datetime() for time in times]
+            self.noon_cache = merge_sorted_datetimes(self.noon_cache, new_times)
+            if times:
+                next_transit = times[0].utc_datetime()
+            else:
+                raise ValueError("No transit found.")
+
+        next_transit += dateutil.relativedelta.relativedelta(minutes=moff)
+        logger.debug(f"skyfield: noon (cached) for {self.orb} with moff={moff}, dt={dt} will be {next_transit}")
+        return next_transit
+
     def noon(self, moff=0, dt=None):
         observer, orb = self.get_observer_and_orb()
         date_utc = self._datetime_in_utc(dt)
@@ -146,6 +183,46 @@ class Orb():
         next_transit = next_transit.astimezone(datetime.UTC)
         logger.debug(f"skyfield: noon for {self.orb} with moff={moff}, dt={dt} will be {next_transit}")
         return next_transit
+
+    def midnight_cached(self, moff=0, dt=None):
+        observer, orb = self.get_observer_and_orb()
+        date_utc = self._datetime_in_utc(dt)
+
+        t = self.ts.from_datetime(date_utc)
+
+        if not self.midnight_cache:
+            start_time = t
+            end_time = self.ts.from_datetime(date_utc + datetime.timedelta(days=self.cache_prefill_horizon))
+
+            def _transit_ha(latitude, declination, altitude_radians):
+                return math.pi
+
+            times, _ = almanac._find(observer, orb, start_time, end_time, 0, _transit_ha)
+            self.midnight_cache = [time.utc_datetime() for time in times]
+
+        if len(self.midnight_cache) > self.max_cache_size:
+            self.midnight_cache = []
+
+        next_antitransit = _find_next_datetime(self.midnight_cache, date_utc)
+
+        if next_antitransit is None:
+            start_time = t
+            end_time = self.ts.from_datetime(date_utc + datetime.timedelta(days=self.cache_prefill_horizon))
+
+            def _transit_ha(latitude, declination, altitude_radians):
+                return math.pi
+
+            times, _ = almanac._find(observer, orb, start_time, end_time, 0, _transit_ha)
+            new_times = [time.utc_datetime() for time in times]
+            self.midnight_cache = merge_sorted_datetimes(self.midnight_cache, new_times)
+            if times:
+                next_antitransit = times[0].utc_datetime()
+            else:
+                raise ValueError("No antitransit found.")
+
+        next_antitransit += dateutil.relativedelta.relativedelta(minutes=moff)
+        logger.debug(f"skyfield: midnight (cached) for {self.orb} with moff={moff}, dt={dt} will be {next_antitransit}")
+        return next_antitransit
 
     def midnight(self, moff=0, dt=None):
         observer, orb = self.get_observer_and_orb()
@@ -177,16 +254,16 @@ class Orb():
 
         t = self.ts.from_datetime(date_utc)
         if doff not in self.rise_cache:
-            times, events = almanac.find_risings(observer, orb, t, t + datetime.timedelta(days=3), doff)
+            times, events = almanac.find_risings(observer, orb, t, t + datetime.timedelta(days=self.cache_prefill_horizon), doff)
             self.rise_cache[doff] = [time.utc_datetime() for time in times]
 
-        if len(self.rise_cache[doff]) > 2000:
+        if len(self.rise_cache[doff]) > self.max_cache_size:
             self.rise_cache[doff] = []
 
         next_rise = _find_next_datetime(self.rise_cache[doff], date_utc)
 
         if next_rise is None:
-            times, events = almanac.find_risings(observer, orb, t, t + datetime.timedelta(days=3), doff)
+            times, events = almanac.find_risings(observer, orb, t, t + datetime.timedelta(days=self.cache_prefill_horizon), doff)
             new_times = [time.utc_datetime() for time in times]
             self.rise_cache[doff] = merge_sorted_datetimes(self.rise_cache[doff], new_times)
             if times:
@@ -230,6 +307,34 @@ class Orb():
         logger.debug(
             f"skyfield: next_rising for {self.orb} with doff={doff}, moff={moff}, center={center}, dt={dt} will be {next_rising}")
         return next_rising
+
+    def set_cached(self, doff=0, moff=0, center=True, dt=None):
+        observer, orb = self.get_observer_and_orb()
+        date_utc = self._datetime_in_utc(dt)
+
+        t = self.ts.from_datetime(date_utc)
+        if doff not in self.set_cache:
+            times, events = almanac.find_settings(observer, orb, t, t + datetime.timedelta(days=self.cache_prefill_horizon), doff)
+            self.set_cache[doff] = [time.utc_datetime() for time in times]
+
+        if len(self.set_cache.get(doff, [])) > self.max_cache_size:
+            self.set_cache[doff] = []
+
+        next_set = _find_next_datetime(self.set_cache.get(doff, []), date_utc)
+
+        if next_set is None:
+            times, events = almanac.find_settings(observer, orb, t, t + datetime.timedelta(days=self.cache_prefill_horizon), doff)
+            new_times = [time.utc_datetime() for time in times]
+            self.set_cache[doff] = merge_sorted_datetimes(self.set_cache.get(doff, []), new_times)
+            if times:
+                next_set = times[0].utc_datetime()
+            else:
+                raise ValueError("No set found.")
+
+        next_set += dateutil.relativedelta.relativedelta(minutes=moff)
+        logger.debug(
+            f"skyfield: next_set (cached) for {self.orb} with doff={doff}, moff={moff}, dt={dt} will be {next_set}")
+        return next_set
 
     def set(self, doff=0, moff=0, center=True, dt=None):
         """
@@ -291,24 +396,17 @@ class Orb():
         for the current time plus an offset
         :param offset: an offset given in minutes
         """
-        observer, orb = self.get_observer_and_orb()
-        date = datetime.datetime.now(datetime.UTC)# UTC-Zeit mit Zeitzoneninformation
+        date = datetime.datetime.now(datetime.UTC)  # UTC-Zeit mit Zeitzoneninformation
         if offset:
             date += dateutil.relativedelta.relativedelta(minutes=offset)
 
         t = self.ts.from_datetime(date)  # Konvertiere datetime in Skyfield-Zeit
 
-        # Berechne die Position des Mondes
-        moon_position = observer.at(t).observe(orb)
-
-        # Hole das Sun-Objekt aus der Ephemeriden-Datei
-        sun = self.planets['sun']
-
         # Berechne den Phasenwinkel zwischen Mond und Sonne
-        phase_angle = moon_position.phase_angle(sun).degrees
+        phase_angle = almanac.moon_phase(self.planets, t).radians
 
         # Berechne den beleuchteten Anteil der Mondoberfläche
-        light = (1 + math.cos(math.radians(phase_angle))) / 2 * 100
+        light = (1 - math.cos(phase_angle)) / 2 * 100
         return int(round(light))
 
 

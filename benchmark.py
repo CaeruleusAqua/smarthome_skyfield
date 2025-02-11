@@ -52,14 +52,18 @@ def benchmark_orbs():
     while current_time < END_DATE:
         # Benchmark für jede Methode
         for class_name, orb in [
-            ("EphemOrb", ephem_orb_sun),
+            #("EphemOrb", ephem_orb_sun),
             ("SkyfieldOrb", skyfield_orb_sun),
         ]:
             for method, args in [
-                ("noon", (0,0,current_time,)),
-                ("midnight", (0,0,current_time,)),
+                ("noon", (0,current_time,)),
+                ("noon_cached", (0,current_time,)),
+                ("midnight", (0,current_time,)),
+                ("midnight_cached", (0,current_time,)),
                 ("rise", (0,0,True,current_time,)),
+                ("rise_cached", (0,0,True,current_time,)),
                 ("set", (0,0,True,current_time,)),
+                ("set_cached", (0,0,True,current_time,)),
                 ("pos", (None,False,current_time,)),
             ]:
                 try:
